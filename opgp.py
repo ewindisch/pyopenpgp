@@ -18,6 +18,7 @@
 import base64
 import re
 import struct
+import sys
 import time
 
 """
@@ -310,13 +311,7 @@ def unarmor(pgp_msg):
     return raw_data
 
 if __name__ == "__main__":
-    # Assume input is half-armored.
-    # base-64, with all other armoring stripped.
-    # ignore checksum.
-
-    with open('full-block-example.asc') as key_fh:
-        key_lines = key_fh.readlines()
-
+    key_lines = sys.stdin.readlines()
     pgp_msg = ''.join(key_lines)
     raw_data = unarmor(pgp_msg)
 
