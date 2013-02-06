@@ -95,7 +95,7 @@ def build_index(raw_data):
         if tag == 0:
             raise Exception("Invalid Format")
 
-        index.append((ptr + skip, tag, length))
+        index.append((tag, ptr + skip, length))
         ptr += skip + length
     return index
 
@@ -137,7 +137,95 @@ def mpi(buf):
     return (int('0x' + inhexstr, 0), ((length + 7) / 8) + 2)
 
 
-def read_packet(pkt_data):
+def read_signature_packet(pkt_data):
+    print len(pkt_data)
+    version = struct.unpack('>B', pkt_data[0])[0]
+
+    if version == 3:
+        """
+          The body of a version 3 Signature Packet contains:
+             - One-octet length of following hashed material.  MUST be 5.
+                 - One-octet signature type.
+                 - Four-octet creation time.
+             - Eight-octet Key ID of signer.
+             - One-octet public-key algorithm.
+             - One-octet hash algorithm.
+             - Two-octet field holding left 16 bits of signed hash value.
+             - One or more multiprecision integers comprising the signature.
+               This portion is algorithm specific, as described below.
+           The concatenation of the data to be signed, the signature type, and
+           creation time from the Signature packet (5 additional octets) is
+           hashed.  The resulting hash value is used in the signature algorithm.
+           The high 16 bits (first two octets) of the hash are included in the
+           Signature packet to provide a quick test to reject some invalid
+           signatures.
+        """
+        (hash_length, key_id, algo, left16) = \
+            struct.unpack('>BQBBH', pkt_data[1:14])
+        ptr = 15
+
+        if hash_length != 5:
+            raise Exception("Hash length must be 5 per RFC.")
+    elif version == 4:
+        """
+         The body of a version 4 Signature packet contains:
+         - One-octet signature type.
+         - One-octet public-key algorithm.
+         - One-octet hash algorithm.
+         - Two-octet scalar octet count for following hashed subpacket data.
+           Note that this is the length in octets of all of the hashed
+           subpackets; a pointer incremented by this number will skip over
+           the hashed subpackets.
+         - Hashed subpacket data set (zero or more subpackets).
+         - Two-octet scalar octet count for the following unhashed subpacket
+           data.  Note that this is the length in octets of all of the
+           unhashed subpackets; a pointer incremented by this number will
+           skip over the unhashed subpackets.
+         - Unhashed subpacket data set (zero or more subpackets).
+         - Two-octet field holding the left 16 bits of the signed hash
+           value.
+         - One or more multiprecision integers comprising the signature.
+           This portion is algorithm specific, as described above.
+        """
+        print len(pkt_data)
+        (sig_type, algo, hash_algo, l_hashed_subpkts) = \
+            struct.unpack('>BBBH', pkt_data[1:6])
+        ptr = 7
+
+        # skip hashed subpkts for now.
+        ptr += l_hashed_subpkts
+
+        l_unhashed_subpkts = struct.unpack('>H', pkt_data[ptr:ptr+2])[0]
+        ptr += 2
+
+        # skip unhashed subpkts for now
+        ptr += l_unhashed_subpkts
+    else:
+        raise Exception("Unknown signature packet version.")
+
+    # extract integers comprising the key material.
+    ptr = 15
+    if algo in (1, 2, 3):  # rsa
+        """
+        Algorithm-Specific Fields for RSA signatures:
+         - multiprecision integer (MPI) of RSA signature value m**d mod n.
+        """
+        print "Found RSA signature."
+        (rsa_sig, seek) = mpi(pkt_data[ptr:]); ptr += seek
+        print "RSA sig=%i" % (rsa_sig, )
+    elif algo == 17:  # dsa
+        """
+        Algorithm-Specific Fields for DSA signatures:
+         - MPI of DSA value r.
+         - MPI of DSA value s.
+        """
+        print "Found DSA signature."
+        (r, seek) = mpi(pkt_data[ptr:]); ptr += seek
+        (s, seek) = mpi(pkt_data[ptr:]); ptr += seek
+        print "DSA params:\nR: %s,\nS: %s" % (r, s)
+
+
+def read_public_key_packet(pkt_data):
     """
     A version 4 packet contains:
      - A one-octet version number (4).
@@ -234,7 +322,13 @@ if __name__ == "__main__":
 
     pkt_index = build_index(raw_data)
 
-    # for each packet where tag == 6
+    # for each packet where tag == 6 (public key)
     # each packet looks like (ptr, tag, length)
-    for pub_key_pkt in [(x, y, z) for x, y, z in pkt_index if y == 6]:
-        print read_packet(raw_data[pub_key_pkt[0]:pub_key_pkt[2]])
+    for pub_key_pkt in [(x, y, z) for x, y, z in pkt_index if x == 6]:
+        print read_public_key_packet(raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
+
+    # for each packet where tag == 2 (signature)
+    # each packet looks like (tag, ptr, length)
+    for pub_key_pkt in [(x, y, z) for x, y, z in pkt_index if x == 2]:
+        print pub_key_pkt
+        print read_signature_packet(raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
