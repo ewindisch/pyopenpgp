@@ -44,7 +44,7 @@ Packet types:
 """
 
 
-def get_header(raw_data):
+def get_packet_header(raw_data):
     header = ord(raw_data[0])
     fbval = header - 192
     if (header >> 6) == 3:  # New format
@@ -86,12 +86,27 @@ def get_header(raw_data):
     raise Exception("Invalid Packet")
 
 
-def build_index(raw_data):
+def build_packet_index(raw_data):
     index = []
     ptr = 0
     print "Length raw_data in octets: %i" % len(raw_data)
     while ptr < len(raw_data):
-        (tag, length, skip) = get_header(raw_data[ptr:])
+        (tag, length, skip) = get_packet_header(raw_data[ptr:])
+
+        if tag == 0:
+            raise Exception("Invalid Format")
+
+        index.append((tag, ptr + skip, length))
+        ptr += skip + length
+    return index
+
+
+def build_subpacket_index(raw_data):
+    index = []
+    ptr = 0
+    print "Length raw_data in octets: %i" % len(raw_data)
+    while ptr < len(raw_data):
+        (tag, length, skip) = get_subpacket_header(raw_data[ptr:])
 
         if tag == 0:
             raise Exception("Invalid Format")
@@ -138,8 +153,64 @@ def mpi(buf):
     return (int('0x' + inhexstr, 0), ((length + 7) / 8) + 2)
 
 
+def get_subpacket_header(pkt_data):
+    """
+       if the 1st octet <  192, then
+           lengthOfLength = 1
+           subpacketLen = 1st_octet
+
+       if the 1st octet >= 192 and < 255, then
+           lengthOfLength = 2
+           subpacketLen = ((1st_octet - 192) << 8) + (2nd_octet) + 192
+
+       if the 1st octet = 255, then
+           lengthOfLength = 5
+           subpacket length = [four-octet scalar starting at 2nd_octet]
+    """
+    oct1 = ord(pkt_data[0])
+    ptr = 0
+    if oct1 < 192:
+        length = oct1
+        ptr += 1
+    elif oct1 >= 192 and oct1 < 255:
+        raw_length = struct.unpack('>H', pkt_data[0:2])[0]
+        length = (raw_length ^ 49152) + 192
+        ptr += 2
+    elif oct1 == 255:
+        length = struct.unpack('>L', raw_data[1:5])[0]
+        ptr += 5
+
+    """
+    The value of the subpacket type octet may be:
+       2 = signature creation time
+       3 = signature expiration time
+       4 = exportable certification
+       5 = trust signature
+       6 = regular expression
+       7 = revocable
+       9 = key expiration time
+       10 = placeholder for backward compatibility
+       11 = preferred symmetric algorithms
+       12 = revocation key
+       16 = issuer key ID
+       20 = notation data
+       21 = preferred hash algorithms
+       22 = preferred compression algorithms
+       23 = key server preferences
+       24 = preferred key server
+       25 = primary user id
+       26 = policy URL
+       27 = key flags
+       28 = signer's user id
+       29 = reason for revocation
+       100 to 110 = internal or user-defined
+    """
+    pkt_type = ord(raw_data[ptr])
+    # ptr is the offset the subpacket data begins.
+    return (pkt_type, length, ptr + 1)
+
+
 def read_signature_packet(pkt_data):
-    print len(pkt_data)
     version = struct.unpack('>B', pkt_data[0])[0]
 
     if version == 3:
@@ -161,8 +232,9 @@ def read_signature_packet(pkt_data):
            Signature packet to provide a quick test to reject some invalid
            signatures.
         """
-        (hash_length, key_id, algo, left16) = \
-            struct.unpack('>BQBBH', pkt_data[1:14])
+        print "SIGPKT v3"
+        (hash_length, sig_type, created_at, key_id, algo, left16) = \
+            struct.unpack('>BBIQBBH', pkt_data[1:14])
         ptr = 15
 
         if hash_length != 5:
@@ -188,13 +260,15 @@ def read_signature_packet(pkt_data):
          - One or more multiprecision integers comprising the signature.
            This portion is algorithm specific, as described above.
         """
-        print len(pkt_data)
+        print "SIGPKT v4"
         (sig_type, algo, hash_algo, l_hashed_subpkts) = \
             struct.unpack('>BBBH', pkt_data[1:6])
         ptr = 7
 
         # skip hashed subpkts for now.
-        ptr += l_hashed_subpkts
+        #ptr += l_hashed_subpkts
+        hashed_subpkt_index = build_subpacket_index(pkt_data[ptr:ptr +
+                                                             l_hashed_subpkts])
 
         l_unhashed_subpkts = struct.unpack('>H', pkt_data[ptr:ptr+2])[0]
         ptr += 2
@@ -204,8 +278,11 @@ def read_signature_packet(pkt_data):
     else:
         raise Exception("Unknown signature packet version.")
 
+    print "Signature type: %0.2X" % sig_type
+
     # extract integers comprising the key material.
     ptr = 15
+    algo_fields = []
     if algo in (1, 2, 3):  # rsa
         """
         Algorithm-Specific Fields for RSA signatures:
@@ -213,6 +290,7 @@ def read_signature_packet(pkt_data):
         """
         print "Found RSA signature."
         (rsa_sig, seek) = mpi(pkt_data[ptr:]); ptr += seek
+        algo_fields.append(rsa_sig)
         print "RSA sig=%i" % (rsa_sig, )
     elif algo == 17:  # dsa
         """
@@ -224,6 +302,8 @@ def read_signature_packet(pkt_data):
         (r, seek) = mpi(pkt_data[ptr:]); ptr += seek
         (s, seek) = mpi(pkt_data[ptr:]); ptr += seek
         print "DSA params:\nR: %s,\nS: %s" % (r, s)
+        algo_fields = (r, s)
+    return (algo_fields, hashed_subpkt_index)
 
 
 def read_public_key_packet(pkt_data):
@@ -315,7 +395,7 @@ if __name__ == "__main__":
     pgp_msg = ''.join(key_lines)
     raw_data = unarmor(pgp_msg)
 
-    pkt_index = build_index(raw_data)
+    pkt_index = build_packet_index(raw_data)
 
     # for each packet where tag == 6 (public key)
     # each packet looks like (ptr, tag, length)
