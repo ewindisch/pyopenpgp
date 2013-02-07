@@ -24,14 +24,17 @@ import time
 """
 Reference material from rfc-2440:
 
+I = implemented
+N = needs implementation
+
 Packet types:
        0        -- Reserved - a packet tag must not have this value
        1        -- Public-Key Encrypted Session Key Packet
-       2        -- Signature Packet
+I      2        -- Signature Packet
        3        -- Symmetric-Key Encrypted Session Key Packet
        4        -- One-Pass Signature Packet
-       5        -- Secret Key Packet
-       6        -- Public Key Packet
+N      5        -- Secret Key Packet
+I      6        -- Public Key Packet
        7        -- Secret Subkey Packet
        8        -- Compressed Data Packet
        9        -- Symmetrically Encrypted Data Packet
@@ -52,15 +55,12 @@ def get_packet_header(raw_data):
         bl_header = ord(raw_data[1])
 
         if bl_header < 192:
-            print "NewSmall"
             return (tag, bl_header, 2)
         elif bl_header > 191 and bl_header < 8384:
-            print "NewMedium"
             raw_length = struct.unpack('>H', raw_data[1:2])[0]
             length = (raw_length ^ 49152) + 192
             return (tag, length, 3)
         elif bl_header == 255:
-            print "NewLarge"
             length = struct.unpack('>L', raw_data[2:6])[0]
             return (tag, length, 6)
         else:
@@ -70,14 +70,11 @@ def get_packet_header(raw_data):
         ltype = 0b00000011 & header
 
         if ltype == 3:
-            print "OldLarge"
             return (tag, len(raw_data) - 1, 1)
         elif ltype == 2:
-            print "OldMedium"
             length = struct.unpack('>L', raw_data[1:5])[0]
             return (tag, length, 5)
         elif ltype < 2:
-            print "OldSmall"
             fmt = ('>B', '>H')[ltype == 1]
             octets = ltype + 1
             length = struct.unpack(fmt, raw_data[1:1 + octets])[0]
@@ -117,35 +114,7 @@ def build_subpacket_index(raw_data):
 
 
 def mpi(buf):
-    """
-    3.2. Multi-Precision Integers
-
-       Multi-Precision Integers (also called MPIs) are unsigned integers
-       used to hold large integers such as the ones used in cryptographic
-       calculations.
-
-       An MPI consists of two pieces: a two-octet scalar that is the length
-       of the MPI in bits followed by a string of octets that contain the
-       actual integer.
-
-       These octets form a big-endian number; a big-endian number can be
-       made into an MPI by prefixing it with the appropriate length.
-
-       Examples:
-
-       (all numbers are in hexadecimal)
-
-       The string of octets [00 01 01] forms an MPI with the value 1. The
-       string [00 09 01 FF] forms an MPI with the value of 511.
-
-       Additional rules:
-
-       The size of an MPI is ((MPI.length + 7) / 8) + 2 octets.
-
-       The length field of an MPI describes the length starting from its
-       most significant non-zero bit. Thus, the MPI [00 02 01] is not formed
-       correctly. It should be [00 01 01].
-    """
+    """http://tools.ietf.org/html/rfc4880#section-3.2"""
     length = struct.unpack(">H", buf[0:2])[0]
     print "Length of MPI: %i" % length
     to_padded_hex = lambda n: '%0.2X' % ord(n)
@@ -154,19 +123,7 @@ def mpi(buf):
 
 
 def get_subpacket_header(pkt_data):
-    """
-       if the 1st octet <  192, then
-           lengthOfLength = 1
-           subpacketLen = 1st_octet
-
-       if the 1st octet >= 192 and < 255, then
-           lengthOfLength = 2
-           subpacketLen = ((1st_octet - 192) << 8) + (2nd_octet) + 192
-
-       if the 1st octet = 255, then
-           lengthOfLength = 5
-           subpacket length = [four-octet scalar starting at 2nd_octet]
-    """
+    """http://tools.ietf.org/html/rfc4880#section-5.2.3.1"""
     oct1 = ord(pkt_data[0])
     ptr = 0
     if oct1 < 192:
@@ -211,27 +168,13 @@ def get_subpacket_header(pkt_data):
 
 
 def read_signature_packet(pkt_data):
-    version = struct.unpack('>B', pkt_data[0])[0]
+    try:
+        version = struct.unpack('>B', pkt_data[0])[0]
+    except:
+        raise Exception("Invalid Packet")
 
     if version == 3:
-        """
-          The body of a version 3 Signature Packet contains:
-             - One-octet length of following hashed material.  MUST be 5.
-                 - One-octet signature type.
-                 - Four-octet creation time.
-             - Eight-octet Key ID of signer.
-             - One-octet public-key algorithm.
-             - One-octet hash algorithm.
-             - Two-octet field holding left 16 bits of signed hash value.
-             - One or more multiprecision integers comprising the signature.
-               This portion is algorithm specific, as described below.
-           The concatenation of the data to be signed, the signature type, and
-           creation time from the Signature packet (5 additional octets) is
-           hashed.  The resulting hash value is used in the signature algorithm.
-           The high 16 bits (first two octets) of the hash are included in the
-           Signature packet to provide a quick test to reject some invalid
-           signatures.
-        """
+        """http://tools.ietf.org/html/rfc4880#section-4.3"""
         print "SIGPKT v3"
         (hash_length, sig_type, created_at, key_id, algo, left16) = \
             struct.unpack('>BBIQBBH', pkt_data[1:14])
@@ -240,26 +183,7 @@ def read_signature_packet(pkt_data):
         if hash_length != 5:
             raise Exception("Hash length must be 5 per RFC.")
     elif version == 4:
-        """
-         The body of a version 4 Signature packet contains:
-         - One-octet signature type.
-         - One-octet public-key algorithm.
-         - One-octet hash algorithm.
-         - Two-octet scalar octet count for following hashed subpacket data.
-           Note that this is the length in octets of all of the hashed
-           subpackets; a pointer incremented by this number will skip over
-           the hashed subpackets.
-         - Hashed subpacket data set (zero or more subpackets).
-         - Two-octet scalar octet count for the following unhashed subpacket
-           data.  Note that this is the length in octets of all of the
-           unhashed subpackets; a pointer incremented by this number will
-           skip over the unhashed subpackets.
-         - Unhashed subpacket data set (zero or more subpackets).
-         - Two-octet field holding the left 16 bits of the signed hash
-           value.
-         - One or more multiprecision integers comprising the signature.
-           This portion is algorithm specific, as described above.
-        """
+        """http://tools.ietf.org/html/rfc4880#section-5.2.3"""
         print "SIGPKT v4"
         (sig_type, algo, hash_algo, l_hashed_subpkts) = \
             struct.unpack('>BBBH', pkt_data[1:6])
@@ -295,8 +219,7 @@ def read_signature_packet(pkt_data):
     elif algo == 17:  # dsa
         """
         Algorithm-Specific Fields for DSA signatures:
-         - MPI of DSA value r.
-         - MPI of DSA value s.
+         - MPI of DSA value r;  MPI of DSA value s.
         """
         print "Found DSA signature."
         (r, seek) = mpi(pkt_data[ptr:]); ptr += seek
@@ -307,13 +230,7 @@ def read_signature_packet(pkt_data):
 
 
 def read_public_key_packet(pkt_data):
-    """
-    A version 4 packet contains:
-     - A one-octet version number (4).
-     - A four-octet number denoting the time that the key was created.
-     - A one-octet number denoting the public-key algorithm of this key.
-     - A series of multiprecision integers comprising the key material.
-    """
+    """http://tools.ietf.org/html/rfc4880#section-5.5.2"""
     (ver, created_at, algo) = struct.unpack('>BIB', pkt_data[0:6])
     if ver != 4:
         raise("Cannot handle versions other than 4 yet (i.e. ver 3)")
@@ -332,7 +249,6 @@ def read_public_key_packet(pkt_data):
            19         - Reserved for ECDSA
            20         - Elgamal (Encrypt or Sign)
     """
-
     # extract integers comprising the key material.
     if algo in (1, 2, 3):  # rsa
         """
@@ -394,6 +310,7 @@ if __name__ == "__main__":
     key_lines = sys.stdin.readlines()
     pgp_msg = ''.join(key_lines)
     raw_data = unarmor(pgp_msg)
+    #raw_data = pgp_msg
 
     pkt_index = build_packet_index(raw_data)
 
