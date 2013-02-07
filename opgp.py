@@ -105,16 +105,95 @@ def build_packet_index(raw_data):
     return index
 
 
+def subpacket_multi(unpack_fmt, octets, data):
+    try:
+        return struct.unpack(unpack_fmt, data[:octets - 1][0])
+    except:
+        raise Exception("Signature Subpacket not recognized or type unknown.")
+
+
+def subpacket_scalar(*args):
+    return subpacket_multi(*args)[0]
+
+
+def subpacket_bool(*args):
+    value = subpacket_scalar(*args)
+    try:
+        return (False, True)[value]
+    except IndexError:
+        raise TypeError("Expected boolean value. Value not boolean.")
+
+
+def subpacket_array(unpack_fmt, data):
+    return [ struct.unpack(unpack_fmt, b)[0] for b in data ]
+
+
+def subpacket_string(data):
+    return str(bytearray(subpacket_array('>c', data)))
+
+
+def subpacket_unsupported(*args):
+    raise NotImplementedError("Subpacket type unsupported.")
+
+
+def subpacket_reason_revoke(data):
+    return (subpacket_scalar('>I', 1, data[0]),
+            subpacket_string(data[1:]))
+
+
+def subpacket_embedded(data):
+    return SignaturePacket(data)
+
+
 class SignatureSubpacket(object):
+    SPTAGTABLE = map(lambda x: None, range(0, 33))  # Initialize with None
+    SPTAGTABLE[2] = ["Signature Creation Time", subpacket_scalar, '>I', 4]
+    SPTAGTABLE[3] = ["Signature Expiration Time", subpacket_scalar, '>I', 4]
+    SPTAGTABLE[4] = ["Exportable Certification", subpacket_bool, '>B', 1]
+    SPTAGTABLE[5] = ["Trust Signature", subpacket_multi, '>BB', 2]
+    SPTAGTABLE[6] = ["Regular Expression", subpacket_unsupported]
+    SPTAGTABLE[7] = ["Revocable", subpacket_bool, '>B', 1]
+    SPTAGTABLE[9] = ["Key Expiration Time", subpacket_scalar, '>I', 4]
+    SPTAGTABLE[11] = ["Preferred Symmetric Algorithms", subpacket_array, '>B']
+    SPTAGTABLE[12] = ["Revocation Key", subpacket_unsupported]
+    SPTAGTABLE[16] = ["Issuer", subpacket_scalar, '>Q', 8]
+    SPTAGTABLE[20] = ["Notation Data", subpacket_unsupported]
+    SPTAGTABLE[21] = ["Preferred Hash Algorithms", subpacket_array, '>B']
+    SPTAGTABLE[22] = ["Preferred Compression Algorithms",
+                      subpacket_array, '>B']
+    SPTAGTABLE[23] = ["Key Server Preferences", subpacket_array, '>B']
+    SPTAGTABLE[24] = ["Preferred Key Server", subpacket_string]
+    SPTAGTABLE[25] = ["Primary User ID", subpacket_bool, '>B', 1]
+    SPTAGTABLE[26] = ["Policy URI", subpacket_string]
+    SPTAGTABLE[27] = ["Key Flags", subpacket_array, '>B']
+    SPTAGTABLE[28] = ["Signer's User ID", subpacket_string]
+    SPTAGTABLE[29] = ["Reason for Revocation", subpacket_reason_revoke]
+    SPTAGTABLE[30] = ["Features", subpacket_array, '>B']
+    SPTAGTABLE[31] = ["Signature Target", subpacket_unsupported]
+    SPTAGTABLE[32] = ["Embedded Signature", subpacket_embedded]
+
     def __init__(self, tag, data):
-        self.data = data
-        self.tag = tag
+        self._data = data
+        self._tag = tag
 
     def tag(self):
-        return tag
+        return self._tag
+
+    def name(self):
+        SignatureSubpacket.SPTAGTABLE[self._tag][0]
 
     def value(self):
-        return self.data
+        # Call mapped function (index 1),
+        # optionally with arguments (index 2+),
+        # always passing self.data as the last argument.
+        entry = SignatureSubpacket.SPTAGTABLE[self._tag]
+
+        if entry == None:
+            raise Exception("Invalid subpacket type.")
+
+        args = entry[len(entry) > 1 and 2 or 1:]
+        args.append(self.data)
+        entry[1](*args)
 
     @staticmethod
     def get_header(pkt_data):
@@ -133,41 +212,9 @@ class SignatureSubpacket(object):
             length = struct.unpack('>L', raw_data[1:5])[0]
             ptr += 5
 
-        """
-        N == "need"
-        R == to support revocations
-        ? == uncertain requirement
-
-        The value of the subpacket type octet may be:
-        N   2 = Signature Creation Time
-        N   3 = Signature Expiration Time
-            4 = Exportable Certification
-        N   5 = Trust Signature
-            6 = Regular Expression
-        R   7 = Revocable
-        ?   9 = Key Expiration Time
-           10 = Placeholder for backward compatibility
-           11 = Preferred Symmetric Algorithms
-        R  12 = Revocation Key
-           16 = Issuer
-           20 = Notation Data
-        ?  21 = Preferred Hash Algorithms
-           22 = Preferred Compression Algorithms
-           23 = Key Server Preferences
-           24 = Preferred Key Server
-           25 = Primary User ID
-           26 = Policy URI
-           27 = Key Flags
-           28 = Signer's User ID
-           29 = Reason for Revocation
-           30 = Features
-        R  31 = Signature Target
-        ?  32 = Embedded Signature
-           100 To 110 = Private or experimental
-        """
         pkt_type = ord(raw_data[ptr])
         # ptr is the offset the subpacket data begins.
-        return (pkt_type, length, ptr + 1)
+        return (pkt_type, ptr + 1, length)
 
 
 class SignatureSubpacketArray(object):
@@ -178,19 +225,21 @@ class SignatureSubpacketArray(object):
         index = []
         ptr = 0
         while ptr < len(raw_data):
-            (tag, length, skip) = SignatureSubpacket.get_header(raw_data[ptr:])
+            (tag, header_size, data_size) = SignatureSubpacket.get_header(raw_data[ptr:])
 
             if tag == 0:
                 raise Exception("Invalid Format")
 
-            index.append((tag, ptr + skip, length))
-            ptr += skip + length
+            # tag, start, end
+            index.append((tag, ptr + header_size, data_size))
+            ptr += header_size + data_size
 
         self.data = raw_data
         self.pkt_index = index
 
     def __iter__(self):
         for tag, seek, length in self.pkt_index:
+            print "tag, seek, length: %s, %s, %s" % (tag, seek, length)
             yield SignatureSubpacket(tag, self.data[seek:seek + length])
 
     def __getitem__(self, i):
@@ -225,11 +274,8 @@ class SignaturePacket(Packet):
                 struct.unpack('>BBBH', pkt_data[1:6])
             ptr = 7
 
-            # skip hashed subpkts for now.
-            #ptr += l_hashed_subpkts
-            #hashed_subpkt_index = build_subpacket_index(pkt_data[ptr:ptr +
-            #                                                     l_hashed_subpkts])
-            hashed_subpkts = SignatureSubpacketArray(pkt_data[ptr: ptr + l_hashed_subpkts])
+            hashed_subpkts = SignatureSubpacketArray(
+                    pkt_data[ptr: ptr + l_hashed_subpkts])
             ptr += l_hashed_subpkts
 
             l_unhashed_subpkts = struct.unpack('>H', pkt_data[ptr:ptr+2])[0]
@@ -376,14 +422,16 @@ if __name__ == "__main__":
     # for each packet where tag == 6 (public key)
     # each packet looks like (ptr, tag, length)
     for pub_key_pkt in [(x, y, z) for x, y, z in pkt_index if x == 6]:
-        print read_public_key_packet(raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
+        print read_public_key_packet(
+            raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
 
     # for each packet where tag == 2 (signature)
     # each packet looks like (tag, ptr, length)
     for pub_key_pkt in [(x, y, z) for x, y, z in pkt_index if x == 2]:
         print pub_key_pkt
         print "Signature packet:"
-        sp = SignaturePacket(raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
+        sp = SignaturePacket(
+            raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
 
         print "Signature version: %i" % sp.version
         print "Signature type: %i" % sp.signature_type
@@ -396,5 +444,6 @@ if __name__ == "__main__":
         print "Subpackets:"
         for pkt in sp.hashed_subpackets():
             print "-----SUBPACKET START-----"
+            print pkt.tag()
             print base64.b64encode(pkt.value())
             print "-----SUBPACKET   END-----"
