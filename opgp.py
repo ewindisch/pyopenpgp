@@ -172,15 +172,16 @@ class SignatureSubpacket(object):
     SPTAGTABLE[31] = ["Signature Target", subpacket_unsupported]
     SPTAGTABLE[32] = ["Embedded Signature", subpacket_embedded]
 
-    def __init__(self, tag, data):
+    def __init__(self, tag, data, critical=False):
         self._data = data
         self._tag = tag
+        self._critical = critical
 
     def tag(self):
         return self._tag
 
     def name(self):
-        SignatureSubpacket.SPTAGTABLE[self._tag][0]
+        return SignatureSubpacket.SPTAGTABLE[self._tag][0]
 
     def value(self):
         # Call mapped function (index 1),
@@ -189,11 +190,18 @@ class SignatureSubpacket(object):
         entry = SignatureSubpacket.SPTAGTABLE[self._tag]
 
         if entry == None:
-            raise Exception("Invalid subpacket type.")
+            if self._critical:
+                raise Exception("Critical packet unsupported.")
+            return ''
 
         args = entry[len(entry) > 1 and 2 or 1:]
         args.append(self.data)
-        entry[1](*args)
+
+        try:
+            entry[1](*args)
+        except NotImplementedError:
+            if self._critical:
+                raise
 
     @staticmethod
     def get_header(pkt_data):
@@ -202,19 +210,25 @@ class SignatureSubpacket(object):
         oct1 = ord(pkt_data[0])
         ptr = 0
         if oct1 < 192:
+            print "Small subpacket"
             length = oct1
             ptr += 1
         elif oct1 >= 192 and oct1 < 255:
+            print "Medium subpacket"
             raw_length = struct.unpack('>H', pkt_data[0:2])[0]
             length = (raw_length ^ 49152) + 192
             ptr += 2
         elif oct1 == 255:
+            print "Large subpacket"
             length = struct.unpack('>L', raw_data[1:5])[0]
             ptr += 5
 
-        pkt_type = ord(raw_data[ptr])
+        raw_tag = ord(raw_data[ptr])
+        critical = raw_tag >> 7
+        tag = (raw_tag | 128) - 128
+        #tag = struct.unpack(">B", raw_data[ptr])[0]
         # ptr is the offset the subpacket data begins.
-        return (pkt_type, ptr + 1, length)
+        return (tag, critical, ptr + 1, length)
 
 
 class SignatureSubpacketArray(object):
@@ -225,26 +239,26 @@ class SignatureSubpacketArray(object):
         index = []
         ptr = 0
         while ptr < len(raw_data):
-            (tag, header_size, data_size) = SignatureSubpacket.get_header(raw_data[ptr:])
-
-            if tag == 0:
-                raise Exception("Invalid Format")
+            (tag, critical, header_size, data_size) = \
+                SignatureSubpacket.get_header(raw_data[ptr:])
 
             # tag, start, end
-            index.append((tag, ptr + header_size, data_size))
+            index.append((tag, critical, ptr + header_size, data_size))
             ptr += header_size + data_size
 
         self.data = raw_data
         self.pkt_index = index
 
     def __iter__(self):
-        for tag, seek, length in self.pkt_index:
+        for tag, critical, seek, length in self.pkt_index:
             print "tag, seek, length: %s, %s, %s" % (tag, seek, length)
-            yield SignatureSubpacket(tag, self.data[seek:seek + length])
+            yield SignatureSubpacket(tag, self.data[seek:seek + length],
+                                     critical=critical)
 
     def __getitem__(self, i):
-        (tag, seek, length) = self.pkt_index[i]
-        return SignatureSubpacket(tag, self.data[seek:seek + length])
+        (tag, critical, seek, length) = self.pkt_index[i]
+        return SignatureSubpacket(tag, self.data[seek:seek + length],
+                                  critical=critical)
 
 
 class Packet(object):
@@ -259,23 +273,24 @@ class SignaturePacket(Packet):
             raise Exception("Invalid Packet")
 
         self.version = version
+        ptr = 1
 
         if version == 3:
             """http://tools.ietf.org/html/rfc4880#section-4.3"""
             (hash_length, sig_type, created_at, key_id, algo, left16) = \
-                struct.unpack('>BBIQBBH', pkt_data[1:14])
-            ptr = 15
+                struct.unpack('>BBIQBBH', pkt_data[ptr:14])
+            ptr += 14
 
             if hash_length != 5:
                 raise Exception("Hash length must be 5 per RFC.")
         elif version == 4:
             """http://tools.ietf.org/html/rfc4880#section-5.2.3"""
             (sig_type, algo, hash_algo, l_hashed_subpkts) = \
-                struct.unpack('>BBBH', pkt_data[1:6])
-            ptr = 7
+                struct.unpack('>BBBH', pkt_data[ptr:6])
+            ptr += 6
 
             hashed_subpkts = SignatureSubpacketArray(
-                    pkt_data[ptr: ptr + l_hashed_subpkts])
+                    pkt_data[ptr:ptr + l_hashed_subpkts])
             ptr += l_hashed_subpkts
 
             l_unhashed_subpkts = struct.unpack('>H', pkt_data[ptr:ptr+2])[0]
@@ -434,11 +449,11 @@ if __name__ == "__main__":
             raw_data[pub_key_pkt[1]:pub_key_pkt[1]+pub_key_pkt[2]])
 
         print "Signature version: %i" % sp.version
-        print "Signature type: %i" % sp.signature_type
+        print "Signature type: %0.2X" % sp.signature_type
         print "Signature uses %s" % sp.algorithm()
 
         print "-----START SIGNATURE-----"
-        print map(base64.b64encode, map(str, sp.signature()))
+        print map(base64.b64encode, map(bytes, sp.signature()))
         print "----- END  SIGNATURE-----"
 
         print "Subpackets:"
